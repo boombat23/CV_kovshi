@@ -1,6 +1,7 @@
 import sys
 import os
 import cv2
+import numpy as np
 from pathlib import Path
 
 from PyQt6.QtWidgets import (
@@ -30,6 +31,8 @@ class ImageLabel(QLabel):
         self.start_point = None
         self.end_point = None
         self.bboxes = []
+        self.eval_mode = False
+        self.eval_threshold = 0.5
 
     def get_image_coordinate(self, pos):
         if not self.pixmap():
@@ -88,7 +91,8 @@ class ImageLabel(QLabel):
 
                     cx, cy = img_coord
                     for i in reversed(range(len(self.bboxes))):
-                        bx, by, bw, bh = self.bboxes[i]
+                        # Берем только первые 4 параметра (координаты), игнорируя уверенность
+                        bx, by, bw, bh = self.bboxes[i][:4]
                         if bx <= cx <= bx + bw and by <= cy <= by + bh:
                             self.bboxes.pop(i)
                             self.update()
@@ -124,7 +128,7 @@ class ImageLabel(QLabel):
                 h = abs(y2 - y1)
 
                 if w > 3 and h > 3:
-                    self.bboxes.append((x, y, w, h))
+                    self.bboxes.append((x, y, w, h, 1.0))
             self.update()
         super().mouseReleaseEvent(event)
 
@@ -179,18 +183,32 @@ class ImageLabel(QLabel):
                 painter.fillRect(rect, QColor(0, 0, 0, 150))
                 painter.drawText(self.current_mouse_pos.x() + 10, self.current_mouse_pos.y() + 20, text)
 
-        if self.annotation_mode:
+        if self.annotation_mode or self.eval_mode:
+            for bbox_data in self.bboxes:
+                bx, by, bw, bh = bbox_data[:4]
+                # Если у рамки есть 5-й параметр (уверенность), берем его, иначе 1.0
+                conf = bbox_data[4] if len(bbox_data) > 4 else 1.0
 
-            pen = QPen(QColor(0, 255, 0))
-            pen.setWidth(2)
-            painter.setPen(pen)
-
-            for (bx, by, bw, bh) in self.bboxes:
                 w_tl = self.get_widget_coordinate(bx, by)
                 w_br = self.get_widget_coordinate(bx + bw, by + bh)
+
                 if w_tl and w_br:
+                    # Логика подсветки "сомнений"
+                    if self.eval_mode:
+                        if conf < self.eval_threshold:
+                            pen = QPen(QColor(255, 0, 0))  # Красный - модель сомневается
+                        else:
+                            pen = QPen(QColor(0, 255, 0))  # Зеленый - модель уверена
+                    else:
+                        pen = QPen(QColor(0, 255, 0))  # В режиме разметки всегда зеленый
+
+                    pen.setWidth(2)
+                    painter.setPen(pen)
                     painter.drawRect(w_tl[0], w_tl[1], w_br[0] - w_tl[0], w_br[1] - w_tl[1])
 
+                    # Отрисовка текста уверенности
+                    if self.eval_mode and conf != 1.0:
+                        painter.drawText(w_tl[0], max(0, w_tl[1] - 5), f"{conf:.2f}")
 
             if self.drawing and self.start_point and self.end_point:
                 pen = QPen(QColor(0, 255, 255))
@@ -285,30 +303,102 @@ class VideoAnnotator(QMainWindow):
         self.btn_convert_video = QPushButton("Video to Frames")
         self.btn_set_frames_dir = QPushButton("Set Frames Dir")
         self.btn_set_ann_dir = QPushButton("Set Ann. Dir")
+
+        # Кнопки аугментации
+        self.btn_augment_all = QPushButton("Augment Dataset")
+        self.btn_augment_all.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold;")
+        self.chk_preview_aug = QCheckBox("Preview Aug")
+
         self.chk_center_line = QCheckBox("Show Center Line")
         self.chk_coordinates = QCheckBox("Show Coordinates")
         self.chk_annotation = QCheckBox("Annotation Mode")
+
+        # Чекбокс оценки модели
+        self.chk_eval_mode = QCheckBox("Model Eval")
 
         self.top_controls.addWidget(self.btn_load_video)
         self.top_controls.addWidget(self.btn_load_folder)
         self.top_controls.addWidget(self.btn_convert_video)
         self.top_controls.addWidget(self.btn_set_frames_dir)
         self.top_controls.addWidget(self.btn_set_ann_dir)
+
+        self.top_controls.addWidget(self.btn_augment_all)
+        self.top_controls.addWidget(self.chk_preview_aug)
+
         self.top_controls.addWidget(self.chk_center_line)
         self.top_controls.addWidget(self.chk_coordinates)
         self.top_controls.addWidget(self.chk_annotation)
+        self.top_controls.addWidget(self.chk_eval_mode)
         self.top_controls.addStretch()
 
         self.main_layout.addLayout(self.top_controls)
 
+        self.content_layout = QHBoxLayout()
 
         self.image_label = ImageLabel()
-        self.main_layout.addWidget(self.image_label, stretch=1)
-
-
+        self.content_layout.addWidget(self.image_label, stretch=1)
         self.image_label.setProperty("orig_w", 0)
         self.image_label.setProperty("orig_h", 0)
 
+        # боковая панель для ползунков аугментации и ползунка уверенности
+        self.side_panels_layout = QVBoxLayout()
+
+        self.aug_panel = QWidget()
+        self.aug_panel.setFixedWidth(250)
+        self.aug_layout = QVBoxLayout(self.aug_panel)
+        self.aug_layout.addWidget(QLabel("<b>Augmentation Settings</b>"))
+
+        self.chk_bright = QCheckBox("Brightness")
+        self.sl_bright = QSlider(Qt.Orientation.Horizontal)
+        self.sl_bright.setRange(-100, 100);
+        self.sl_bright.setValue(0)
+        self.aug_layout.addWidget(self.chk_bright);
+        self.aug_layout.addWidget(self.sl_bright)
+
+        self.chk_noise = QCheckBox("Noise")
+        self.sl_noise = QSlider(Qt.Orientation.Horizontal)
+        self.sl_noise.setRange(1, 100);
+        self.sl_noise.setValue(25)
+        self.aug_layout.addWidget(self.chk_noise);
+        self.aug_layout.addWidget(self.sl_noise)
+
+        self.chk_blur = QCheckBox("Blur")
+        self.sl_blur = QSlider(Qt.Orientation.Horizontal)
+        self.sl_blur.setRange(1, 10);
+        self.sl_blur.setValue(2)
+        self.aug_layout.addWidget(self.chk_blur);
+        self.aug_layout.addWidget(self.sl_blur)
+
+        self.chk_vshift = QCheckBox("Vertical Shift")
+        self.sl_vshift = QSlider(Qt.Orientation.Horizontal)
+        self.sl_vshift.setRange(-50, 50);
+        self.sl_vshift.setValue(15)
+        self.aug_layout.addWidget(self.chk_vshift);
+        self.aug_layout.addWidget(self.sl_vshift)
+
+        self.aug_panel.hide()
+        self.side_panels_layout.addWidget(self.aug_panel)
+
+        self.eval_panel = QWidget()
+        self.eval_panel.setFixedWidth(250)
+        self.eval_layout = QVBoxLayout(self.eval_panel)
+
+        self.eval_layout.addWidget(QLabel("<b>Model Evaluation</b>"))
+        self.lbl_conf = QLabel("Doubt Threshold: 0.50")
+        self.eval_layout.addWidget(self.lbl_conf)
+        self.sl_conf = QSlider(Qt.Orientation.Horizontal)
+        self.sl_conf.setRange(0, 100);
+        self.sl_conf.setValue(50)
+        self.eval_layout.addWidget(self.sl_conf)
+
+        self.eval_panel.hide()
+        self.side_panels_layout.addWidget(self.eval_panel)
+
+        self.side_panels_layout.addStretch()
+        self.content_layout.addLayout(self.side_panels_layout)
+        # ============================================
+
+        self.main_layout.addLayout(self.content_layout, stretch=1)
 
         self.bottom_controls = QHBoxLayout()
         self.slider = QSlider(Qt.Orientation.Horizontal)
@@ -318,7 +408,6 @@ class VideoAnnotator(QMainWindow):
         self.bottom_controls.addWidget(self.lbl_frame_info)
 
         self.main_layout.addLayout(self.bottom_controls)
-
 
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
@@ -334,6 +423,39 @@ class VideoAnnotator(QMainWindow):
         self.chk_annotation.stateChanged.connect(self.toggle_annotation)
         self.btn_set_frames_dir.clicked.connect(self.set_frames_folder)
         self.btn_set_ann_dir.clicked.connect(self.set_annotations_folder)
+
+        # Сигналы Аугментации
+        self.btn_augment_all.clicked.connect(self.augment_dataset)
+        self.chk_preview_aug.stateChanged.connect(self.toggle_aug_panel)
+
+        update_preview = lambda: self.update_frame(self.current_frame_idx)
+        self.chk_bright.stateChanged.connect(update_preview)
+        self.sl_bright.valueChanged.connect(update_preview)
+        self.chk_noise.stateChanged.connect(update_preview)
+        self.sl_noise.valueChanged.connect(update_preview)
+        self.chk_blur.stateChanged.connect(update_preview)
+        self.sl_blur.valueChanged.connect(update_preview)
+        self.chk_vshift.stateChanged.connect(update_preview)
+        self.sl_vshift.valueChanged.connect(update_preview)
+
+        # Сигналы Оценки Модели (Model Eval)
+        self.chk_eval_mode.stateChanged.connect(self.toggle_eval_mode)
+        self.sl_conf.valueChanged.connect(self.change_conf_threshold)
+
+    def toggle_eval_mode(self, state):
+        is_checked = (state == Qt.CheckState.Checked.value)
+        self.image_label.eval_mode = is_checked
+        self.eval_panel.setVisible(is_checked)
+
+        QApplication.processEvents()
+
+        self.update_frame(self.current_frame_idx)
+
+    def change_conf_threshold(self, value):
+        threshold = value / 100.0
+        self.lbl_conf.setText(f"Doubt Threshold: {threshold:.2f}")
+        self.image_label.eval_threshold = threshold
+        self.image_label.update()
 
     def set_frames_folder(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Frames Folder")
@@ -502,13 +624,16 @@ class VideoAnnotator(QMainWindow):
                 with open(lbl_path, "r") as f:
                     for line in f:
                         parts = line.strip().split()
-                        if len(parts) == 5:
-                            cls_id, xc, yc, bw, bh = map(float, parts)
+                        if len(parts) >= 5:
+                            cls_id, xc, yc, bw, bh = map(float, parts[:5])
+                            # Если есть 6-й параметр, берем его. Иначе 1.0 (ручная разметка)
+                            conf = float(parts[5]) if len(parts) == 6 else 1.0
+
                             bx = int((xc - bw / 2) * w)
                             by = int((yc - bh / 2) * h)
                             bw_px = int(bw * w)
                             bh_px = int(bh * h)
-                            self.image_label.bboxes.append((bx, by, bw_px, bh_px))
+                            self.image_label.bboxes.append((bx, by, bw_px, bh_px, conf))
             except Exception as e:
                 print(f"Error loading annotations: {e}")
 
@@ -548,7 +673,9 @@ class VideoAnnotator(QMainWindow):
 
             self.frames_dir.mkdir(parents=True, exist_ok=True)
             img_path = self.frames_dir / f"{base_name}.jpg"
-            cv2.imwrite(str(img_path), self.current_frame)
+            is_success, im_buf_arr = cv2.imencode(".jpg", self.current_frame)
+            if is_success:
+                im_buf_arr.tofile(str(img_path))
             self.status_bar.showMessage(f"Saved {base_name} to {self.frames_dir.name}.")
         else:
             images_dir = self.annotations_dir / "images"
@@ -559,17 +686,34 @@ class VideoAnnotator(QMainWindow):
             img_path = images_dir / f"{base_name}.jpg"
             lbl_path = labels_dir / f"{base_name}.txt"
 
-            cv2.imwrite(str(img_path), self.current_frame)
+
+            frame_rgb = cv2.cvtColor(self.current_frame, cv2.COLOR_BGR2RGB)
+            h, w, ch = frame_rgb.shape
+
+            q_img = QImage(frame_rgb.data, w, h, ch * w, QImage.Format.Format_RGB888)
+            success = q_img.save(str(img_path))
+
+            # Если даже Qt не сможет сохранить, мы хотя бы увидим ошибку в консоли
+            if not success:
+                print(f"КРИТИЧЕСКАЯ ОШИБКА: Не удалось сохранить файл по пути -> {img_path}")
 
             if self.image_label.bboxes:
                 h, w = self.current_frame.shape[:2]
                 with open(lbl_path, "w") as f:
-                    for (bx, by, bw, bh) in self.image_label.bboxes:
+                    for bbox_data in self.image_label.bboxes:
+                        bx, by, bw, bh = bbox_data[:4]
+                        conf = bbox_data[4] if len(bbox_data) > 4 else 1.0
+
                         x_center = (bx + bw / 2.0) / w
                         y_center = (by + bh / 2.0) / h
                         norm_w = bw / w
                         norm_h = bh / h
-                        f.write(f"0 {x_center:.6f} {y_center:.6f} {norm_w:.6f} {norm_h:.6f}\n")
+
+                        # Сохраняем с уверенностью, если это предсказание модели
+                        if conf != 1.0:
+                            f.write(f"0 {x_center:.6f} {y_center:.6f} {norm_w:.6f} {norm_h:.6f} {conf:.4f}\n")
+                        else:
+                            f.write(f"0 {x_center:.6f} {y_center:.6f} {norm_w:.6f} {norm_h:.6f}\n")
             else:
                 lbl_path.touch()
 
@@ -579,7 +723,15 @@ class VideoAnnotator(QMainWindow):
         if self.current_frame is None:
             return
 
-        frame_rgb = cv2.cvtColor(self.current_frame, cv2.COLOR_BGR2RGB)
+        frame_to_display = self.current_frame.copy()
+        display_bboxes = self.image_label.bboxes.copy()
+
+        # Если включен предпросмотр, применяем настройки из панели
+        if hasattr(self, 'chk_preview_aug') and self.chk_preview_aug.isChecked():
+            frame_to_display, display_bboxes = self.apply_ui_augmentations(frame_to_display, display_bboxes)
+            self.image_label.bboxes = display_bboxes
+
+        frame_rgb = cv2.cvtColor(frame_to_display, cv2.COLOR_BGR2RGB)
         h, w, ch = frame_rgb.shape
         bytes_per_line = ch * w
 
@@ -618,6 +770,174 @@ class VideoAnnotator(QMainWindow):
             self.image_label.update()
         else:
             super().keyPressEvent(event)
+
+    def toggle_preview_aug(self, state):
+        self.update_frame(self.current_frame_idx)
+
+    def toggle_aug_panel(self, state):
+        if state == Qt.CheckState.Checked.value:
+            self.aug_panel.show()
+        else:
+            self.aug_panel.hide()
+
+        QApplication.processEvents()
+
+        self.update_frame(self.current_frame_idx)
+
+    def apply_ui_augmentations(self, image, bboxes):
+
+        res_img = image.copy()
+        res_bboxes = bboxes.copy()
+
+        # 1. Brightness
+        if self.chk_bright.isChecked():
+            beta = self.sl_bright.value()
+            res_img = cv2.convertScaleAbs(res_img, alpha=1.0, beta=beta)
+
+        # 2. Noise
+        if self.chk_noise.isChecked():
+            intensity = self.sl_noise.value()
+            row, col, ch = res_img.shape
+            gauss = np.random.randn(row, col, ch) * intensity
+            res_img = np.clip(res_img + gauss, 0, 255).astype(np.uint8)
+
+        # 3. Blur
+        if self.chk_blur.isChecked():
+            val = self.sl_blur.value()
+            k_size = val * 2 + 1
+            res_img = cv2.GaussianBlur(res_img, (k_size, k_size), 0)
+
+        # 4. Vertical Shift
+        if self.chk_vshift.isChecked():
+            shift_val = self.sl_vshift.value()
+            res_img, res_bboxes = self.apply_vertical_shift(res_img, res_bboxes, shift_val)
+
+        return res_img, res_bboxes
+
+    def apply_vertical_shift(self, image, bboxes, shift_percent):
+        """
+        Накладывает кадр поверх себя со сдвигом.
+        Рамки вычисляются как среднее арифметическое всех координат (X, Y, W, H).
+        shift_percent: от -50 (вверх) до 50 (вниз)
+        """
+        h, w = image.shape[:2]
+
+        # Рассчитываем сдвиг по вертикали
+        dy = int(h * (shift_percent / 100.0))
+
+        if dy == 0:
+            return image, bboxes.copy()
+
+        # Создаем сдвинутое изображение
+        M = np.float32([[1, 0, 0], [0, 1, dy]])
+        shifted_img = cv2.warpAffine(image, M, (w, h), borderMode=cv2.BORDER_REPLICATE)
+
+        # Смешиваем изображения
+        blended = cv2.addWeighted(image, 0.5, shifted_img, 0.5, 0)
+
+        # Вычисление среднего арифметического координат
+        final_bboxes = []
+
+        for (bx, by, bw, bh) in bboxes:
+            # Координаты оригинальной рамки
+            orig_x, orig_y, orig_w, orig_h = bx, by, bw, bh
+
+            # Координаты "сдвинутой" рамки
+            shift_x, shift_y, shift_w, shift_h = bx, by + dy, bw, bh
+
+            # Вычисляем честное среднее арифметическое по каждому параметру:
+            mean_x = int((orig_x + shift_x) / 2.0)
+            mean_y = int((orig_y + shift_y) / 2.0)
+            mean_w = int((orig_w + shift_w) / 2.0)
+            mean_h = int((orig_h + shift_h) / 2.0)
+
+            # Защита от выхода рамки за пределы экрана:
+            x1 = max(0, min(w, mean_x))
+            y1 = max(0, min(h, mean_y))
+            x2 = max(0, min(w, mean_x + mean_w))
+            y2 = max(0, min(h, mean_y + mean_h))
+
+            final_w = x2 - x1
+            final_h = y2 - y1
+
+            if final_w > 1 and final_h > 1:
+                final_bboxes.append((x1, y1, final_w, final_h))
+
+        return blended, final_bboxes
+
+    def augment_dataset(self):
+        """Пакетная генерация аугментаций для всех размеченных данных"""
+        images_dir = self.annotations_dir / "images"
+        labels_dir = self.annotations_dir / "labels"
+
+        if not images_dir.exists() or not labels_dir.exists():
+            self.status_bar.showMessage("Нет данных для аугментации!")
+            return
+
+        images = list(images_dir.glob("*.jpg"))
+        if not images:
+            return
+
+        self.status_bar.showMessage(f"Начинаю аугментацию {len(images)} изображений...")
+        QApplication.processEvents()
+
+        count = 0
+        for img_path in images:
+            if "_aug_" in img_path.stem:
+                continue
+
+            img = cv2.imdecode(np.fromfile(str(img_path), dtype=np.uint8), cv2.IMREAD_COLOR)
+            lbl_path = labels_dir / f"{img_path.stem}.txt"
+
+            bboxes = []
+            if lbl_path.exists():
+                h, w = img.shape[:2]
+                with open(lbl_path, "r") as f:
+                    for line in f:
+                        parts = line.strip().split()
+                        if len(parts) == 5:
+                            cls_id, xc, yc, bw, bh = map(float, parts)
+                            bx = int((xc - bw / 2) * w)
+                            by = int((yc - bh / 2) * h)
+                            bw_px = int(bw * w)
+                            bh_px = int(bh * h)
+                            bboxes.append((bx, by, bw_px, bh_px))
+
+            aug_img, aug_bboxes = self.apply_ui_augmentations(img.copy(), bboxes.copy())
+
+            # Если хотя бы одна аугментация включена, сохраняем результат
+            if self.chk_bright.isChecked() or self.chk_noise.isChecked() or self.chk_blur.isChecked() or self.chk_vshift.isChecked():
+                self.save_augmented_data(aug_img, aug_bboxes, img_path.stem, "aug_custom")
+                count += 1
+
+        self.status_bar.showMessage(f"Готово! Создано {count} новых изображений.")
+        self.update_status_counts(False)
+
+    def save_augmented_data(self, img, bboxes, original_name, suffix):
+        """Вспомогательная функция для сохранения сгенерированных данных"""
+        images_dir = self.annotations_dir / "images"
+        labels_dir = self.annotations_dir / "labels"
+
+        new_name = f"{original_name}_{suffix}"
+
+        is_success, im_buf_arr = cv2.imencode(".jpg", img)
+        if is_success:
+            im_buf_arr.tofile(str(images_dir / f"{new_name}.jpg"))
+        else:
+            print(f"Не удалось сохранить: {new_name}.jpg")
+
+        # Сохраняем рамки в формате YOLO
+        lbl_path = labels_dir / f"{new_name}.txt"
+        h, w = img.shape[:2]
+        with open(lbl_path, "w") as f:
+            for (bx, by, bw, bh) in bboxes:
+                x_center = (bx + bw / 2.0) / w
+                y_center = (by + bh / 2.0) / h
+                norm_w = bw / w
+                norm_h = bh / h
+                x_center, y_center = min(max(x_center, 0), 1), min(max(y_center, 0), 1)
+                norm_w, norm_h = min(max(norm_w, 0), 1), min(max(norm_h, 0), 1)
+                f.write(f"0 {x_center:.6f} {y_center:.6f} {norm_w:.6f} {norm_h:.6f}\n")
 
 
 def main():
