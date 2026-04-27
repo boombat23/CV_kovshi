@@ -31,7 +31,7 @@ class ImageLabel(QLabel):
         super().__init__(parent)
         self.setMouseTracking(True)
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.setStyleSheet("background-color: gray;")
+        self.setStyleSheet("background-color: black;")
         self.setMinimumSize(640, 480)
 
         self.drawing = False
@@ -226,6 +226,7 @@ class SimpleAnnotator(QMainWindow):
         self.frames_dir = None
         self.annotations_dir = None
         self.labels_dir = None
+        self.use_custom_annotations_dir = False
         self.image_files = []
         self.current_frame = None
         self.current_frame_idx = 0
@@ -251,6 +252,7 @@ class SimpleAnnotator(QMainWindow):
         self.btn_load_frames = QPushButton("Load Prepared Frames")
         self.btn_set_ann_dir = QPushButton("Set Annotation Dir")
         self.btn_save = QPushButton("Save Label")
+        self.btn_suggest = QPushButton("Suggest from Prev15")
         self.btn_prev_unlabeled = QPushButton("Prev Unlabeled")
         self.btn_next_unlabeled = QPushButton("Next Unlabeled")
 
@@ -276,6 +278,7 @@ class SimpleAnnotator(QMainWindow):
             self.btn_load_frames,
             self.btn_set_ann_dir,
             self.btn_save,
+            self.btn_suggest,
             self.btn_prev_unlabeled,
             self.btn_next_unlabeled,
             self.cmb_class,
@@ -286,6 +289,7 @@ class SimpleAnnotator(QMainWindow):
             self.chk_autosave,
         ]:
             top.addWidget(w)
+            w.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         top.addStretch()
         main.addLayout(top)
 
@@ -297,6 +301,7 @@ class SimpleAnnotator(QMainWindow):
         bottom = QHBoxLayout()
         self.slider = QSlider(Qt.Orientation.Horizontal)
         self.slider.setEnabled(False)
+        self.slider.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.lbl_info = QLabel("Frame: 0 / 0")
         bottom.addWidget(self.slider)
         bottom.addWidget(self.lbl_info)
@@ -313,6 +318,7 @@ class SimpleAnnotator(QMainWindow):
         self.btn_load_frames.clicked.connect(self.load_frames_folder)
         self.btn_set_ann_dir.clicked.connect(self.set_annotations_folder)
         self.btn_save.clicked.connect(self.save_current_label)
+        self.btn_suggest.clicked.connect(self.suggest_annotation_from_history)
         self.btn_prev_unlabeled.clicked.connect(self.goto_prev_unlabeled)
         self.btn_next_unlabeled.clicked.connect(self.goto_next_unlabeled)
         self.slider.valueChanged.connect(self.goto_frame)
@@ -332,6 +338,10 @@ class SimpleAnnotator(QMainWindow):
         self.on_fixed_box_controls_changed()
 
         last_frames = self.settings.value("last_frames_dir", "")
+        self.use_custom_annotations_dir = self.settings.value("use_custom_annotations_dir", False, type=bool)
+        custom_ann_dir = self.settings.value("custom_annotations_dir", "")
+        if self.use_custom_annotations_dir and custom_ann_dir:
+            self.annotations_dir = Path(custom_ann_dir)
         last_frame_idx = self.settings.value("last_frame_idx", 0, type=int)
         if last_frames and Path(last_frames).exists():
             self.load_frames_folder_internal(last_frames)
@@ -343,6 +353,9 @@ class SimpleAnnotator(QMainWindow):
             self.settings.setValue("last_frames_dir", str(self.frames_dir))
         if self.annotations_dir:
             self.settings.setValue("last_annotations_dir", str(self.annotations_dir))
+        self.settings.setValue("use_custom_annotations_dir", self.use_custom_annotations_dir)
+        if self.use_custom_annotations_dir and self.annotations_dir:
+            self.settings.setValue("custom_annotations_dir", str(self.annotations_dir))
         self.settings.setValue("last_frame_idx", self.current_frame_idx)
         self.settings.setValue("fixed_box_enabled", self.chk_fixed_box.isChecked())
         self.settings.setValue("fixed_box_w", self.fixed_box_w.value())
@@ -389,12 +402,7 @@ class SimpleAnnotator(QMainWindow):
             self.autosave_timer.start()
 
     def infer_default_annotations_dir(self, frames_dir: Path):
-        explicit = self.settings.value("last_annotations_dir", "")
         candidate = frames_dir.parent / f"{frames_dir.name}_annotations"
-        if candidate.exists():
-            return candidate
-        if explicit and Path(explicit).exists():
-            return Path(explicit)
         return candidate
 
     def load_frames_folder(self):
@@ -416,7 +424,9 @@ class SimpleAnnotator(QMainWindow):
         self.total_frames = len(image_files)
         self.current_frame_idx = 0
 
-        if self.annotations_dir is None:
+        if not self.use_custom_annotations_dir:
+            self.annotations_dir = self.infer_default_annotations_dir(folder_path)
+        elif self.annotations_dir is None:
             self.annotations_dir = self.infer_default_annotations_dir(folder_path)
         self.labels_dir = self.annotations_dir / "labels"
         self.labels_dir.mkdir(parents=True, exist_ok=True)
@@ -433,9 +443,12 @@ class SimpleAnnotator(QMainWindow):
             return
         self.flush_changes()
         self.annotations_dir = Path(folder)
+        self.use_custom_annotations_dir = True
         self.labels_dir = self.annotations_dir / "labels"
         self.labels_dir.mkdir(parents=True, exist_ok=True)
         self.settings.setValue("last_annotations_dir", str(self.annotations_dir))
+        self.settings.setValue("use_custom_annotations_dir", True)
+        self.settings.setValue("custom_annotations_dir", str(self.annotations_dir))
         self.write_dataset_link()
         self.goto_frame(self.current_frame_idx)
         self.update_fixed_box_log()
@@ -458,6 +471,20 @@ class SimpleAnnotator(QMainWindow):
     def label_path_for_index(self, idx):
         base_name = self.image_files[idx].stem
         return self.labels_dir / f"{base_name}.txt"
+
+    def read_label_normalized(self, idx):
+        lbl_path = self.label_path_for_index(idx)
+        if not lbl_path.exists():
+            return None
+        rows = []
+        with open(lbl_path, "r", encoding="utf-8") as f:
+            for line in f:
+                parts = line.strip().split()
+                if len(parts) >= 5:
+                    cls_id = int(float(parts[0]))
+                    xc, yc, bw, bh = map(float, parts[1:5])
+                    rows.append((cls_id, xc, yc, bw, bh))
+        return rows
 
     def flush_changes(self):
         if self.unsaved_changes:
@@ -482,6 +509,188 @@ class SimpleAnnotator(QMainWindow):
         self.unsaved_changes = False
         self.status_bar.showMessage(f"Saved: {lbl_path.name}")
         self.update_fixed_box_log()
+
+    def suggest_annotation_from_history(self):
+        if self.current_frame is None or not self.labels_dir or self.current_frame_idx < 15:
+            self.status_bar.showMessage("Need at least 15 previous frames for suggestion.")
+            return
+
+        # Берём всю доступную историю до текущего кадра.
+        history = []
+        for idx in range(0, self.current_frame_idx):
+            rows = self.read_label_normalized(idx)
+            if rows:
+                history.append((idx, rows))
+
+        if len(history) < 15:
+            self.status_bar.showMessage("Need at least 15 annotated previous frames for suggestion.")
+            return
+
+        # Оценка цикличности: ищем период n, где конфигурация кадров наиболее похожа.
+        def frame_signature(rows):
+            counts = {}
+            for cls_id, xc, yc, bw, bh in rows:
+                counts[cls_id] = counts.get(cls_id, 0) + 1
+            mean_x = float(np.mean([r[1] for r in rows])) if rows else 0.0
+            mean_y = float(np.mean([r[2] for r in rows])) if rows else 0.0
+            return counts, mean_x, mean_y
+
+        signatures = {idx: frame_signature(rows) for idx, rows in history}
+        history_indices = [idx for idx, _ in history]
+        max_period = min(120, max(2, len(history_indices) // 2))
+        best_period = None
+        best_score = float("inf")
+        for period in range(2, max_period + 1):
+            scores = []
+            for idx in history_indices:
+                prev_idx = idx - period
+                if prev_idx not in signatures:
+                    continue
+                counts_a, ax, ay = signatures[idx]
+                counts_b, bx, by = signatures[prev_idx]
+                keys = set(counts_a) | set(counts_b)
+                count_diff = sum(abs(counts_a.get(k, 0) - counts_b.get(k, 0)) for k in keys)
+                pos_diff = abs(ax - bx) + abs(ay - by)
+                scores.append(count_diff + pos_diff * 5.0)
+            if len(scores) >= 8:
+                avg = float(np.mean(scores))
+                if avg < best_score:
+                    best_score = avg
+                    best_period = period
+
+        target_idx = self.current_frame_idx
+        if best_period is not None:
+            phase_history = [(idx, rows) for idx, rows in history if idx % best_period == target_idx % best_period]
+            selected_history = phase_history if len(phase_history) >= 5 else history
+        else:
+            selected_history = history
+
+        # Предсказываем КОЛИЧЕСТВО bbox по классам (медиана по истории/фазе).
+        class_count_series = {}
+        for _, rows in selected_history:
+            counts = {}
+            for cls_id, *_ in rows:
+                counts[cls_id] = counts.get(cls_id, 0) + 1
+            for cls_id, count in counts.items():
+                class_count_series.setdefault(cls_id, []).append(count)
+
+        predicted_counts = {}
+        for cls_id, counts in class_count_series.items():
+            predicted_counts[cls_id] = int(max(0, round(float(np.median(counts)))))
+
+        if not predicted_counts:
+            self.status_bar.showMessage("No usable history for suggestion.")
+            return
+
+        # Для каждого класса сортируем bbox слева-направо, формируем треки по rank (0..k-1),
+        # чтобы предсказать НЕ один bbox, а столько, сколько нужно.
+        per_class_rank_tracks = {}
+        for frame_idx, rows in selected_history:
+            by_class = {}
+            for cls_id, xc, yc, bw, bh in rows:
+                by_class.setdefault(cls_id, []).append((xc, yc, bw, bh))
+            for cls_id, boxes in by_class.items():
+                boxes_sorted = sorted(boxes, key=lambda b: b[0])
+                for rank, (xc, yc, bw, bh) in enumerate(boxes_sorted):
+                    per_class_rank_tracks.setdefault((cls_id, rank), []).append((frame_idx, xc, yc, bw, bh))
+
+        # Глобальная динамика: движение/изменение размеров похоже для всех ковшей.
+        # Считаем усреднённый "шаг" между соседними кадрами для всех доступных треков.
+        deltas_x = []
+        deltas_y = []
+        deltas_w_rel = []
+        deltas_h_rel = []
+        for track in per_class_rank_tracks.values():
+            track = sorted(track, key=lambda t: t[0])
+            for i in range(1, len(track)):
+                f0, x0, y0, w0, h0 = track[i - 1]
+                f1, x1, y1, w1, h1 = track[i]
+                step = max(1, f1 - f0)
+                deltas_x.append((x1 - x0) / step)
+                deltas_y.append((y1 - y0) / step)
+                if w0 > 1e-6:
+                    deltas_w_rel.append(((w1 / w0) - 1.0) / step)
+                if h0 > 1e-6:
+                    deltas_h_rel.append(((h1 / h0) - 1.0) / step)
+
+        global_dx = float(np.median(deltas_x)) if deltas_x else 0.0
+        global_dy = float(np.median(deltas_y)) if deltas_y else 0.0
+        global_dw_rel = float(np.median(deltas_w_rel)) if deltas_w_rel else 0.0
+        global_dh_rel = float(np.median(deltas_h_rel)) if deltas_h_rel else 0.0
+
+        # Якорный кадр — последний в выбранной истории (обычно в той же фазе цикла).
+        anchor_idx = max(idx for idx, _ in selected_history)
+        anchor_rows = next(rows for idx, rows in selected_history if idx == anchor_idx)
+        anchor_by_class = {}
+        for cls_id, xc, yc, bw, bh in anchor_rows:
+            anchor_by_class.setdefault(cls_id, []).append((xc, yc, bw, bh))
+        for cls_id in list(anchor_by_class.keys()):
+            anchor_by_class[cls_id] = sorted(anchor_by_class[cls_id], key=lambda b: b[0])
+
+        h, w = self.current_frame.shape[:2]
+        suggested = []
+
+        for cls_id, pred_count in predicted_counts.items():
+            for rank in range(pred_count):
+                track = per_class_rank_tracks.get((cls_id, rank), [])
+                if not track:
+                    continue
+                track = sorted(track, key=lambda t: t[0])
+                xs = np.array([t[0] for t in track], dtype=np.float32)
+                vals = np.array([[t[1], t[2], t[3], t[4]] for t in track], dtype=np.float32)
+
+                anchor_box = None
+                if cls_id in anchor_by_class and rank < len(anchor_by_class[cls_id]):
+                    anchor_box = anchor_by_class[cls_id][rank]
+
+                if anchor_box is not None:
+                    # Базовый прогноз: переносим якорный bbox с глобальным шагом движения.
+                    steps = max(1, target_idx - anchor_idx)
+                    ax, ay, aw, ah = anchor_box
+                    xc = ax + global_dx * steps
+                    yc = ay + global_dy * steps
+                    bw = aw * max(0.05, (1.0 + global_dw_rel) ** steps)
+                    bh = ah * max(0.05, (1.0 + global_dh_rel) ** steps)
+                else:
+                    xc, yc, bw, bh = np.median(vals, axis=0).tolist()
+
+                # Локальная коррекция по треку rank/class
+                if len(track) >= 8:
+                    pred = []
+                    for col in range(4):
+                        p = np.polyfit(xs, vals[:, col], 1)
+                        pred.append(float(np.polyval(p, target_idx)))
+                    # blend: глобальное движение + индивидуальный тренд
+                    xc = 0.6 * xc + 0.4 * pred[0]
+                    yc = 0.6 * yc + 0.4 * pred[1]
+                    bw = 0.7 * bw + 0.3 * pred[2]
+                    bh = 0.7 * bh + 0.3 * pred[3]
+
+                xc = min(max(xc, 0.0), 1.0)
+                yc = min(max(yc, 0.0), 1.0)
+                bw = min(max(bw, 0.001), 1.0)
+                bh = min(max(bh, 0.001), 1.0)
+
+                bx = int((xc - bw / 2.0) * w)
+                by = int((yc - bh / 2.0) * h)
+                bw_px = int(bw * w)
+                bh_px = int(bh * h)
+
+                x1 = max(0, min(w - 1, bx))
+                y1 = max(0, min(h - 1, by))
+                x2 = max(x1 + 1, min(w, x1 + max(1, bw_px)))
+                y2 = max(y1 + 1, min(h, y1 + max(1, bh_px)))
+                suggested.append((x1, y1, x2 - x1, y2 - y1, 1.0, cls_id))
+
+        self.image_label.bboxes = suggested
+        self.image_label.update()
+        self.unsaved_changes = True
+        if self.autosave_enabled:
+            self.autosave_timer.start()
+        cycle_msg = f", period≈{best_period}" if best_period is not None else ""
+        self.status_bar.showMessage(
+            f"Suggested {len(suggested)} boxes from history (min 15 required{cycle_msg}). Please review."
+        )
 
     def load_label(self, idx):
         self.image_label.bboxes = []
